@@ -70,13 +70,14 @@ export function createPaymentApp(customDb = null, options = {}) {
   const auditRepo = new AuditLogRepository(db);
   const deviceRepo = new DeviceRepository(db);
 
-  // --- Auto-seed default UPI receiving account on boot ---
+  // --- Auto-seed / update default UPI receiving account on boot ---
   try {
     const seedMerchantId = '00000000-0000-0000-0000-000000000001';
     const seedUpiId = process.env.SEED_UPI_ID || '9123761944@apl';
     const seedPayeeName = process.env.SEED_PAYEE_NAME || 'Raaz Web City';
 
     const existingSeed = accountRepo.findActiveForMerchant(seedMerchantId);
+
     if (!existingSeed) {
       accountRepo.create({
         merchantId: seedMerchantId,
@@ -87,12 +88,22 @@ export function createPaymentApp(customDb = null, options = {}) {
       });
       console.log(`✅ Seeded UPI receiving account: ${seedUpiId} for merchant ${seedMerchantId}`);
     } else {
-      console.log(`ℹ️ Active UPI receiving account already exists: ${existingSeed.upiId || existingSeed.upi_id}`);
+      const existingUpi = existingSeed.upiId || existingSeed.upi_id;
+      if (existingUpi !== seedUpiId) {
+        console.log(`♻️ Existing UPI '${existingUpi}' differs from desired '${seedUpiId}' — updating...`);
+        db.query(
+          'UPDATE payment_receiving_accounts SET upi_id = ?, payee_name = ? WHERE id = ?',
+          [seedUpiId, seedPayeeName, existingSeed.id]
+        );
+        console.log(`✅ Updated receiving account ${existingSeed.id} → ${seedUpiId}`);
+      } else {
+        console.log(`ℹ️ Active UPI receiving account already correct: ${existingUpi}`);
+      }
     }
   } catch (seedErr) {
     console.error('❌ Failed to seed UPI receiving account:', seedErr.message);
   }
-  // --------------------------------------------------------
+  // ----------------------------------------------------------------
 
   const eventEmitter = new EventEmitter();
 
