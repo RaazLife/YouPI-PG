@@ -70,6 +70,30 @@ export function createPaymentApp(customDb = null, options = {}) {
   const auditRepo = new AuditLogRepository(db);
   const deviceRepo = new DeviceRepository(db);
 
+  // --- Auto-seed default UPI receiving account on boot ---
+  try {
+    const seedMerchantId = '00000000-0000-0000-0000-000000000001';
+    const seedUpiId = process.env.SEED_UPI_ID || '9123761944@apl';
+    const seedPayeeName = process.env.SEED_PAYEE_NAME || 'Raaz Web City';
+
+    const existingSeed = accountRepo.findActiveForMerchant(seedMerchantId);
+    if (!existingSeed) {
+      accountRepo.create({
+        merchantId: seedMerchantId,
+        upiId: seedUpiId,
+        payeeName: seedPayeeName,
+        isMerchantEnabled: true,
+        isActive: true
+      });
+      console.log(`✅ Seeded UPI receiving account: ${seedUpiId} for merchant ${seedMerchantId}`);
+    } else {
+      console.log(`ℹ️ Active UPI receiving account already exists: ${existingSeed.upiId || existingSeed.upi_id}`);
+    }
+  } catch (seedErr) {
+    console.error('❌ Failed to seed UPI receiving account:', seedErr.message);
+  }
+  // --------------------------------------------------------
+
   const eventEmitter = new EventEmitter();
 
   const queueEngine = new QueueEngine({
@@ -112,14 +136,20 @@ export function createPaymentApp(customDb = null, options = {}) {
   });
 
   const server = new HttpServer();
-  let checkoutBaseUrl = process.env.BASE_CHECKOUT_URL || 'http://localhost:7000';
+
+  // Resolve checkout base URL — accept both env var names for compatibility
+  let checkoutBaseUrl =
+    process.env.BASE_CHECKOUT_URL ||
+    process.env.CHECKOUT_BASE_URL ||
+    'http://localhost:7000';
+
   try {
     const rootEnv = path.resolve(__dirname, '../../../.env');
     if (fs.existsSync(rootEnv)) {
       const raw = fs.readFileSync(rootEnv, 'utf8');
       for (const line of raw.split(/\r?\n/)) {
         const trimmed = line.trim();
-        if (trimmed.startsWith('BASE_CHECKOUT_URL=')) {
+        if (trimmed.startsWith('BASE_CHECKOUT_URL=') || trimmed.startsWith('CHECKOUT_BASE_URL=')) {
           const val = trimmed.split('=')[1]?.trim();
           if (val) checkoutBaseUrl = val.replace(/^["']|["']$/g, '');
         }
@@ -226,9 +256,7 @@ export function createPaymentApp(customDb = null, options = {}) {
     }
   });
 
-  // Active 30-Second Verification Polling Orchestrator (Triple Verification Standard):
-  // Concurrently sweeps Gmail, Google Messages SMS, and Android Observer every 1.5s
-  // Continues polling for remaining sources until Level 3 (Triple Verification) is reached or 30s window finishes!
+  // Active 30-Second Verification Polling Orchestrator (Triple Verification Standard)
   const activeSweepTimers = new Set();
 
   eventEmitter.on('SESSION.PROCESSING', (data) => {
@@ -241,7 +269,6 @@ export function createPaymentApp(customDb = null, options = {}) {
         sweepCount++;
         const current = sessionRepo.findById(sessionId);
 
-        // Stop polling if session is terminal failed/expired/cancelled, or reached full Triple Verification (level >= 3), or exceeded 30s
         const isCompleteOrCancelled = !current ||
           current.status === PaymentStatus.FAILED ||
           current.status === PaymentStatus.EXPIRED ||
@@ -255,19 +282,16 @@ export function createPaymentApp(customDb = null, options = {}) {
           return;
         }
 
-        // Sweep 1: Google Messages Web SMS
         try {
           const smsPort = Number(process.env.SMS_OBSERVER_PORT || 6002);
           fetch(`http://localhost:${smsPort}/api/sweep`, { method: 'POST', signal: AbortSignal.timeout(1200) }).catch(() => {});
         } catch {}
 
-        // Sweep 2: Gmail Inbox
         try {
           const gmailPort = Number(process.env.GMAIL_OBSERVER_PORT || 6003);
           fetch(`http://localhost:${gmailPort}/api/sweep`, { method: 'POST', signal: AbortSignal.timeout(1200) }).catch(() => {});
         } catch {}
 
-        // Sweep 3: Check pending/unattributed Android push notifications in DB
         try {
           const unattributed = obsRepo.findUnattributed(current.receivingAccountId);
           for (const obs of unattributed) {
@@ -298,7 +322,6 @@ export function createPaymentApp(customDb = null, options = {}) {
     try {
       const nowIso = new Date().toISOString();
 
-      // Sweep expired ACTIVE sessions
       const expiredActive = db.query(`
         SELECT id, receiving_account_id FROM payment_sessions
         WHERE status = 'ACTIVE' AND expires_at <= ?
@@ -310,7 +333,6 @@ export function createPaymentApp(customDb = null, options = {}) {
         handleSlotFreedAndPromote(row.receiving_account_id);
       }
 
-      // Sweep failed PROCESSING sessions
       const failedProc = db.query(`
         SELECT id, receiving_account_id FROM payment_sessions
         WHERE status = 'PROCESSING' AND processing_expires_at <= ?
@@ -322,7 +344,6 @@ export function createPaymentApp(customDb = null, options = {}) {
         handleSlotFreedAndPromote(row.receiving_account_id);
       }
 
-      // Scan for vacant receiving accounts that have waiting queued sessions
       const vacantAccounts = db.query(`
         SELECT id FROM payment_receiving_accounts
         WHERE is_active = 1 AND (is_slot_busy = 0 OR current_active_session_id IS NULL)
@@ -339,7 +360,6 @@ export function createPaymentApp(customDb = null, options = {}) {
   // Continuous 1-Second Aggressive Polling Daemon across SMS Gateway & Gmail Observers
   const aggressivePollerDaemon = setInterval(async () => {
     try {
-      // Find all active/processing sessions currently waiting for bank confirmation
       const activeSessions = db.query(`
         SELECT id, receiving_account_id, amount_paise, status
         FROM payment_sessions
@@ -348,19 +368,16 @@ export function createPaymentApp(customDb = null, options = {}) {
 
       if (activeSessions.length === 0) return;
 
-      // 1. Poll SMS Observer
       try {
         const smsPort = Number(process.env.SMS_OBSERVER_PORT || 6002);
         fetch(`http://localhost:${smsPort}/api/sweep`, { method: 'POST', signal: AbortSignal.timeout(800) }).catch(() => {});
       } catch {}
 
-      // 2. Poll Gmail Observer
       try {
         const gmailPort = Number(process.env.GMAIL_OBSERVER_PORT || 6003);
         fetch(`http://localhost:${gmailPort}/api/sweep`, { method: 'POST', signal: AbortSignal.timeout(800) }).catch(() => {});
       } catch {}
 
-      // 3. Sweep any pending unattributed observations in DB matching active sessions
       for (const session of activeSessions) {
         try {
           const unattributed = obsRepo.findUnattributed(session.receiving_account_id);
@@ -462,11 +479,12 @@ export function createPaymentApp(customDb = null, options = {}) {
 }
 
 export function startServer(port = null, customDb = null) {
-  const finalPort = port || Number(process.env.PAYMENT_API_PORT || 6100);
+  // Priority: explicit arg → Render's PORT → project-specific PAYMENT_API_PORT → 6100 fallback
+  const finalPort = port || Number(process.env.PORT || process.env.PAYMENT_API_PORT || 6100);
   const app = createPaymentApp(customDb);
 
   return new Promise(resolve => {
-    const instance = app.rawServer.listen(finalPort, () => {
+    const instance = app.rawServer.listen(finalPort, '0.0.0.0', () => {
       console.log(`[Payment API] Server listening on port ${finalPort}`);
       resolve({
         app,
