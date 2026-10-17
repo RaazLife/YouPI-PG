@@ -17,12 +17,20 @@ import { isTerminalStatus, toPublicOutcome } from '@youpi/core';
  */
 export function registerPaymentRoutes(server, ctx) {
   function resolveCheckoutBaseUrl(merchant) {
+    // 1. Force environment variable if present (ideal for Render)
+    if (process.env.CHECKOUT_BASE_URL) {
+      return process.env.CHECKOUT_BASE_URL;
+    }
+
+    // 2. Fallback to merchant branding
     if (merchant?.branding) {
       try {
         const urls = resolveRuntimeUrls(merchant.branding);
         if (urls && urls.checkoutUrl) return urls.checkoutUrl;
       } catch {}
     }
+    
+    // 3. Fallback to local context or localhost
     return ctx.checkoutBaseUrl || 'http://localhost:7000';
   }
 
@@ -204,10 +212,6 @@ export function registerPaymentRoutes(server, ctx) {
     }
 
     // Invariant: Do NOT start payment session timer until customer is authenticated/logged in!
-    // Customer sign in or sign up in the checkout portal is mandatory before slot activation or timer start.
-    // Digital UPI payments MUST ALWAYS start in status INITIATED without acquiring a concurrency slot or timer.
-    // Only physical counter payments (CASH_COUNTER, CARD_COUNTER) start as ACTIVE (they do not use UPI slots).
-    // The only exception for UPI auto-activation is explicit developer test suite flag: body.autoActivate === true.
     const isExplicitTestAutoActivate = body.autoActivate === true || body.autoActivate === 'true';
     const shouldActivateNow = isCounterPayment || isExplicitTestAutoActivate;
     const initialStatus = isCounterPayment ? PaymentStatus.ACTIVE : PaymentStatus.INITIATED;
