@@ -3,12 +3,15 @@ import { fileURLToPath } from 'node:url';
 import { CheckoutServer } from './server.js';
 
 export function startCheckoutServer(port = null, options = {}) {
-  const finalPort = port || Number(process.env.CHECKOUT_PORTAL_PORT || 7000);
+  // Priority: explicit arg → Render's PORT → project-specific CHECKOUT_PORTAL_PORT → 7000 fallback
+  const finalPort = port || Number(process.env.PORT || process.env.CHECKOUT_PORTAL_PORT || 7000);
+  
   const checkoutServer = new CheckoutServer(options);
   const rawServer = checkoutServer.createServer();
 
   return new Promise(resolve => {
-    const instance = rawServer.listen(finalPort, () => {
+    // Bind to '0.0.0.0' to accept connections from outside the container (required by Render)
+    const instance = rawServer.listen(finalPort, '0.0.0.0', () => {
       console.log(`[Checkout Portal] Server listening on port ${finalPort}`);
       resolve({
         port: finalPort,
